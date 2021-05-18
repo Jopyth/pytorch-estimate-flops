@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Tuple
 import torch
 import torch.fx
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .utils import same_device, print_table
 
@@ -40,6 +41,40 @@ def _count_convNd(module: Any, output: torch.Tensor, args: Tuple[Any], kwargs: D
     return total_ops
 
 
+def _count_func_convNd(module: Any, output: torch.Tensor, args: Tuple[Any], kwargs: Dict[str, Any]) -> int:
+    r"""Estimates the number of FLOPs in conv layer
+
+    .. warning::
+        Currently it ignore the padding
+
+    :param node_string: an onnx node defining a convolutional layer
+
+    :return: number of FLOPs
+    :rtype: `int`
+    """
+    weight_size = list(kwargs["weight"].size())
+
+    kernel_size = weight_size[-2:]
+    in_channels = weight_size[0]
+    out_channels = weight_size[1]
+
+    filters_per_channel = out_channels // kwargs["groups"]
+    conv_per_position_flops = reduce(lambda x, y: x * y, kernel_size) * \
+        in_channels * filters_per_channel
+
+    active_elements_count = output.shape[0] * reduce(lambda x, y: x * y, output.shape[2:])
+
+    overall_conv_flops = conv_per_position_flops * active_elements_count
+
+    bias_ops = 0
+    if kwargs["bias"] is not None:
+        bias_ops = out_channels * active_elements_count
+
+    total_ops = overall_conv_flops + bias_ops
+
+    return total_ops
+
+
 def _count_relu(module: Any, output: torch.Tensor, args: Tuple[Any], kwargs: Dict[str, Any]) -> int:
     r"""Estimates the number of FLOPs of a  ReLU activation.
     The function will count the comparison operation as a FLOP.
@@ -50,6 +85,19 @@ def _count_relu(module: Any, output: torch.Tensor, args: Tuple[Any], kwargs: Dic
     :rtype: `int`
     """
     total_ops = 2 * output.numel()  # also count the comparison
+    return total_ops
+
+
+def _count_prelu(module: Any, output: torch.Tensor, args: Tuple[Any], kwargs: Dict[str, Any]) -> int:
+    r"""Estimates the number of FLOPs of a  ReLU activation.
+    The function will count the comparison operation as a FLOP.
+
+    :param node_string: an onnx node defining a ReLU op
+
+    :return: number of FLOPs
+    :rtype: `int`
+    """
+    total_ops = 4 * output.numel()  # also count the comparison
     return total_ops
 
 
@@ -152,6 +200,7 @@ def _undefined_op(module: Any, output: torch.Tensor, args: Tuple[Any], kwargs: D
     :return: always 0
     :rtype: `int`
     """
+    print("Warning: undefined operations for {}".format(module))
     return 0
 
 
@@ -160,6 +209,8 @@ def count_operations(module: Any) -> Any:
         return _count_convNd
     elif isinstance(module, nn.ReLU):
         return _count_relu
+    elif isinstance(module, nn.PReLU):
+        return _count_prelu
     elif isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
         return _count_bn
     elif isinstance(module, torch.nn.modules.pooling._MaxPoolNd):
@@ -172,6 +223,8 @@ def count_operations(module: Any) -> Any:
         return _count_linear
     elif 'add' == module or 'mul' == module:
         return _count_add_mul
+    elif 'conv2d' == module:
+        return _count_func_convNd
     elif 'matmul' == module:
         return _count_linear
     else:
@@ -219,6 +272,20 @@ class ProfilingInterpreter(torch.fx.Interpreter):
         output = target(*args, **kwargs)
 
         current_ops = count_operations(target.__name__)(target, output, args, kwargs)
+
+        return output, current_ops, 0
+
+
+    def call_method(self, target: 'Target', args: Tuple[Any], kwargs: Dict[str, Any]) -> Any:
+        arg_0 = args[0]
+        remaining_args = args[1:]
+
+        fn = getattr(arg_0, target)
+
+        # Execute the method and return the result
+        output = fn(*remaining_args, **kwargs)
+
+        current_ops = count_operations(target)(target, output, args, kwargs)
 
         return output, current_ops, 0
 
