@@ -9,6 +9,25 @@ import torch.nn.functional as F
 from .utils import same_device, print_table
 
 
+def is_ignored(module: Any):
+    # previous work ignores matrix transformations and sign function
+    if 'view' == module:
+        return True
+    if 'unsqueeze' == module:
+        return True
+    if 'contiguous' == module:
+        return True
+    if 'transpose' == module:
+        return True
+    if 'sign' == module:
+        return True
+    if 'cat' == module:
+        return True
+    if 'getitem' == module:
+        return True
+    return False
+
+
 def _count_convNd(module: Any, output: torch.Tensor, args: Tuple[Any], kwargs: Dict[str, Any]) -> int:
     r"""Estimates the number of FLOPs in conv layer
 
@@ -192,6 +211,20 @@ def _count_add_mul(module: Any, output: torch.Tensor, args: Tuple[Any], kwargs: 
     return output.numel() * len(args)
 
 
+def _count_replication_padding(module: Any, output: torch.Tensor, args: Tuple[Any], kwargs: Dict[str, Any]) -> int:
+    r"""Estimates the number of FLOPs of a summation op.
+
+    :param node_string: an onnx node defining a summation op
+
+    :return: number of FLOPs
+    :rtype: `int`
+    """
+    _, C, H, W = list(output.size())
+    last_axis_pad = module.padding[-1] + module.padding[-2]
+    other_axis_pad = module.padding[-3] + module.padding[-4]
+    return last_axis_pad * H * C + other_axis_pad * W * C
+
+
 def _undefined_op(module: Any, output: torch.Tensor, args: Tuple[Any], kwargs: Dict[str, Any]) -> int:
     r"""Default case for undefined or free (in terms of FLOPs) operations
 
@@ -205,7 +238,9 @@ def _undefined_op(module: Any, output: torch.Tensor, args: Tuple[Any], kwargs: D
 
 
 def count_operations(module: Any) -> Any:
-    if isinstance(module, torch.nn.modules.conv._ConvNd):
+    if is_ignored(module):
+        return lambda a, b, c, d: 0
+    elif isinstance(module, torch.nn.modules.conv._ConvNd):
         return _count_convNd
     elif isinstance(module, nn.ReLU):
         return _count_relu
@@ -219,6 +254,8 @@ def count_operations(module: Any) -> Any:
         return _count_avgpool
     elif isinstance(module, torch.nn.modules.pooling._AdaptiveAvgPoolNd):
         return _count_globalavgpool
+    elif isinstance(module, torch.nn.ReplicationPad2d):
+        return _count_replication_padding
     elif isinstance(module, torch.nn.Linear):
         return _count_linear
     elif 'add' == module or 'mul' == module:
@@ -240,13 +277,21 @@ class ProfilingInterpreter(torch.fx.Interpreter):
 
         self.flops: Dict[torch.fx.Node, float] = {}
         self.parameters: Dict[torch.fx.Node, float] = {}
+        self.output_dimensions: Dict[torch.fx.Node, Any] = {}
 
     def run_node(self, n: torch.fx.Node) -> Any:
         return_val = super().run_node(n)
         if isinstance(return_val, Tuple):
             self.flops[n] = return_val[1]
             self.parameters[n] = return_val[2]
+            self.output_dimensions[n] = list(return_val[0].size())
             return_val = return_val[0]
+
+        # # binary convolution is functional so we need to count the weights separately, which we do here
+        # if n.name.endswith("_weight") and n.op == 'get_attr':
+        #     self.flops[n] = 0
+        #     self.output_dimensions[n] = list(return_val[0].size())
+        #     self.parameters[n] = reduce(lambda x, y: x * y, list(return_val[0].size()), 1)
 
         return return_val
 
@@ -273,7 +318,11 @@ class ProfilingInterpreter(torch.fx.Interpreter):
 
         current_ops = count_operations(target.__name__)(target, output, args, kwargs)
 
-        return output, current_ops, 0
+        params = 0
+        if target.__name__ == "conv2d":
+            params = reduce(lambda x, y: x * y, list(kwargs["weight"].size()), 1)
+
+        return output, current_ops, params
 
 
     def call_method(self, target: 'Target', args: Tuple[Any], kwargs: Dict[str, Any]) -> Any:
@@ -335,13 +384,13 @@ def count_ops_fx(model: torch.nn.Module,
         if current_ops and verbose:
             all_data.append(['{}'.format(name), current_ops])
 
-    if print_readable:
-        if verbose:
-            print_table(all_data)
-        print("Input size: {0}".format(tuple(input.shape)))
-        print("{:,} FLOPs or approx. {:,.2f} GFLOPs".format(ops, ops / 1e+9))
+    # if print_readable:
+    #     if verbose:
+    #         print_table(all_data)
+    #     print("Input size: {0}".format(tuple(input.shape)))
+    #     print("{:,} FLOPs or approx. {:,.2f} GFLOPs".format(ops, ops / 1e+9))
 
     if model_status:
         model.train()
 
-    return ops, all_data
+    return tracer
