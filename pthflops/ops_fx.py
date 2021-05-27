@@ -25,6 +25,8 @@ def is_ignored(module: Any):
         return True
     if 'getitem' == module:
         return True
+    if isinstance(module, torch.nn.ReplicationPad2d):
+        return True
     return False
 
 
@@ -74,14 +76,14 @@ def _count_func_convNd(module: Any, output: torch.Tensor, args: Tuple[Any], kwar
     weight_size = list(kwargs["weight"].size())
 
     kernel_size = weight_size[-2:]
-    in_channels = weight_size[0]
+    in_channels = weight_size[0] * kwargs["groups"]
     out_channels = weight_size[1]
 
     filters_per_channel = out_channels // kwargs["groups"]
     conv_per_position_flops = reduce(lambda x, y: x * y, kernel_size) * \
         in_channels * filters_per_channel
 
-    active_elements_count = output.shape[0] * reduce(lambda x, y: x * y, output.shape[2:])
+    active_elements_count = output.shape[0] * reduce(lambda x, y: x * y, output.shape[2:]) // kwargs["dilation"] // kwargs["dilation"]
 
     overall_conv_flops = conv_per_position_flops * active_elements_count
 
